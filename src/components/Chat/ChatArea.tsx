@@ -63,17 +63,19 @@ export function ChatArea() {
         status: 'complete',
       });
 
-      // 准备 API 消息（历史消息 + 当前消息）
+      // 准备 API 消息（历史消息 + 当前消息；失败/中断的消息不作为上下文）
       const apiMessages: APIMessage[] = [
-        ...historyMessages.map((msg) => ({
-          role: msg.role,
-          content: msg.content,
-        })),
+        ...historyMessages
+          .filter((msg) => msg.status !== 'error')
+          .map((msg) => ({
+            role: msg.role,
+            content: msg.content,
+          })),
         { role: 'user' as const, content },
       ];
 
-      // 开始流式响应
-      startStreaming(conversationId);
+      // 开始流式响应（占位消息创建即落盘，返回其稳定 id）
+      const assistantMessageId = startStreaming(conversationId);
 
       try {
         const stream = sendMessageStream(apiMessages, {
@@ -83,16 +85,18 @@ export function ChatArea() {
 
         await streamHandler.start(stream, {
           onChunk: (chunk) => {
-            appendStreamContent(chunk);
+            // 按会话/消息 id 定位：流式期间切换对话也不会写错记录
+            appendStreamContent(conversationId, assistantMessageId, chunk);
           },
           onComplete: (stats) => {
-            finishStreaming(toMessageStats(stats));
+            finishStreaming(conversationId, assistantMessageId, toMessageStats(stats));
           },
           onError: (error) => {
             const appError = parseError(error);
             logError(appError, 'ChatArea.handleSend');
             message.error(appError.message);
-            cancelStreaming();
+            // 超时等异常也保留已收到的部分内容
+            cancelStreaming(conversationId, assistantMessageId);
 
             if (shouldShowConfigPanel(appError)) {
               setConfigPanelVisible(true);
@@ -103,7 +107,7 @@ export function ChatArea() {
         const appError = parseError(error);
         logError(appError, 'ChatArea.handleSend');
         message.error(appError.message);
-        cancelStreaming();
+        cancelStreaming(conversationId, assistantMessageId);
 
         if (shouldShowConfigPanel(appError)) {
           setConfigPanelVisible(true);
@@ -125,8 +129,11 @@ export function ChatArea() {
   );
 
   const handleStop = useCallback(() => {
+    const { streamingConversationId, streamingMessageId } = useChatStore.getState();
     streamHandler.abort();
-    cancelStreaming();
+    if (streamingConversationId && streamingMessageId) {
+      cancelStreaming(streamingConversationId, streamingMessageId);
+    }
     message.info('已停止响应');
   }, [cancelStreaming]);
 

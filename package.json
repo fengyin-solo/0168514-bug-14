@@ -8,9 +8,10 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "test": "vitest",
-    "test:unit": "vitest run --dir tests/unit",
-    "test:property": "vitest run --dir tests/property",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run tests/unit",
+    "test:property": "vitest run tests/property",
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {

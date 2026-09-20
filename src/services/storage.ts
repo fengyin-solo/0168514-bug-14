@@ -1,4 +1,4 @@
-import type { AppConfig, Conversation, PromptTemplate } from '../types';
+import type { AppConfig, Conversation, Message, PromptTemplate } from '../types';
 import { DEFAULT_CONFIG, DEFAULT_TEMPLATES } from '../types';
 
 // Storage keys
@@ -102,6 +102,40 @@ export function clearConfig(): void {
 }
 
 /**
+ * 归一化单条消息
+ * 页面在流式响应过程中被关闭/刷新后，重新加载时该消息仍停留在
+ * streaming/pending 状态，但当前页面已经没有活动的流连接，不可能再继续。
+ * 将其标记为 error，保留已接收到的部分内容，避免出现“永远在转圈”
+ * 或重复生成同一条回复的情况。时间戳与位置保持不变。
+ */
+function normalizeMessage(message: Message): Message {
+  if (message.status === 'streaming' || message.status === 'pending') {
+    return {
+      ...message,
+      content: message.content || '（响应未完成）',
+      status: 'error' as const,
+    };
+  }
+  return message;
+}
+
+/**
+ * 归一化对话：清理无效消息、修复中断的流式消息
+ */
+function normalizeConversation(conv: Conversation): Conversation {
+  const messages = (conv.messages || [])
+    .filter((msg) => msg && msg.id && msg.role)
+    .map(normalizeMessage);
+
+  return {
+    ...conv,
+    messages,
+    createdAt: conv.createdAt ?? conv.updatedAt ?? Date.now(),
+    updatedAt: conv.updatedAt ?? conv.createdAt ?? Date.now(),
+  };
+}
+
+/**
  * 保存对话列表到 localStorage
  * @param conversations 对话列表
  */
@@ -144,14 +178,129 @@ export function loadConversations(): Conversation[] {
       return [];
     }
     
-    // 过滤无效数据并按更新时间排序
+    // 验证数据结构、修复中断的流式消息，并按更新时间排序
     return parsed
       .filter(conv => conv && conv.id && Array.isArray(conv.messages))
+      .map(normalizeConversation)
       .sort((a, b) => b.updatedAt - a.updatedAt);
   } catch (error) {
     console.error('Failed to load conversations:', error);
     return [];
   }
+}
+
+/**
+ * 合并消息状态：绝不改写时间戳。
+ * - complete 是终态，优先级最高（完成的回复不会被流式半截覆盖）；
+ * - streaming 与 error 之间以已接收内容更长者为准（跨窗口 flush 时序）；
+ * - 内容等长时 error 视为更稳定的状态。
+ */
+function mergeMessage(local: Message, remote: Message): Message {
+  const pick = (winner: Message): Message => ({
+    ...winner,
+    // 时间戳是消息创建时刻，任何合并都不得改动
+    timestamp: local.timestamp,
+  });
+
+  if (local.status === 'complete') return local;
+  if (remote.status === 'complete') return pick(remote);
+
+  if (local.status === remote.status) {
+    const preferRemote =
+      remote.content.length > local.content.length ||
+      (!local.stats && !!remote.stats);
+    return pick(preferRemote ? remote : local);
+  }
+
+  const isErrorLocal = local.status === 'error';
+  const isErrorRemote = remote.status === 'error';
+
+  if (isErrorLocal !== isErrorRemote) {
+    const errorMsg = isErrorLocal ? local : remote;
+    const streamingMsg = isErrorLocal ? remote : local;
+    // 流式内容比中断提示更长时，保留更完整的那份
+    return pick(streamingMsg.content.length > errorMsg.content.length ? streamingMsg : errorMsg);
+  }
+
+  return pick(remote.content.length > local.content.length ? remote : local);
+}
+
+/**
+ * 合并两个对话快照（用于多窗口 storage 事件同步）
+ *
+ * 合并原则：
+ * - 以消息 id 为唯一身份做去重，保证同一条回复不会出现两份；
+ * - 保持消息的既有顺序与时间戳，新消息按时间戳追加到末尾；
+ * - 任一方已有的消息都不会被丢弃（union 合并）。
+ */
+function mergeConversation(local: Conversation, remote: Conversation): Conversation {
+  const merged = new Map<string, Message>();
+
+  for (const msg of local.messages) {
+    merged.set(msg.id, msg);
+  }
+  for (const msg of remote.messages) {
+    const existing = merged.get(msg.id);
+    merged.set(msg.id, existing ? mergeMessage(existing, msg) : msg);
+  }
+
+  const messages = Array.from(merged.values()).sort((a, b) => a.timestamp - b.timestamp);
+
+  return {
+    ...local,
+    ...remote,
+    title: remote.title || local.title,
+    messages,
+    createdAt: Math.min(local.createdAt, remote.createdAt),
+    updatedAt: Math.max(local.updatedAt, remote.updatedAt),
+  };
+}
+
+/**
+ * 校验单个对话结构（不改动消息状态）
+ * storage 事件对端传来的 streaming 消息可能确实仍在生成中，
+ * 归一化为 error 只能发生在“本窗口启动加载”时，不能发生在同步路径上。
+ */
+function sanitizeConversation(conv: Conversation): Conversation | null {
+  if (!conv || !conv.id || !Array.isArray(conv.messages)) {
+    return null;
+  }
+
+  const messages = conv.messages.filter((msg) => msg && msg.id && msg.role);
+
+  return {
+    ...conv,
+    messages,
+    createdAt: conv.createdAt ?? conv.updatedAt ?? Date.now(),
+    updatedAt: conv.updatedAt ?? conv.createdAt ?? Date.now(),
+  };
+}
+
+/**
+ * 将另一份对话快照合并进当前快照（跨窗口同步入口）
+ *
+ * 每次保存写入的都是全量快照，因此以 incoming 的会话集合为准：
+ * - incoming 中缺失的会话视为已在其它窗口被删除，不做“复活”；
+ * - 同 id 会话内按消息 id 去重合并，保证同一条回复不会出现两份；
+ * - 保持消息既有顺序与时间戳，任一方已有的消息都不会被丢弃。
+ *
+ * @param local 当前窗口内存中的对话
+ * @param incoming storage 事件带来的最新对话
+ * @returns 合并后的对话列表（保持按 updatedAt 降序）
+ */
+export function mergeConversations(
+  local: Conversation[],
+  incoming: Conversation[]
+): Conversation[] {
+  return incoming
+    .map((raw) => {
+      const remote = sanitizeConversation(raw);
+      if (!remote) return null;
+      const existing = local.find((conv) => conv.id === remote.id);
+      return existing ? mergeConversation(existing, remote) : remote;
+    })
+    .filter((conv): conv is Conversation => conv !== null)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 /**

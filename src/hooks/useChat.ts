@@ -20,6 +20,7 @@ export function useChat() {
     activeConversationId,
     isStreaming,
     streamingMessageId,
+    streamingConversationId,
     getActiveConversation,
     createConversation,
     deleteConversation,
@@ -60,17 +61,19 @@ export function useChat() {
         status: 'complete',
       });
 
-      // 准备 API 消息
+      // 准备 API 消息（失败/中断的消息不作为上下文发送）
       const apiMessages: APIMessage[] = [
-        ...messages.map((msg) => ({
-          role: msg.role,
-          content: msg.content,
-        })),
+        ...messages
+          .filter((msg) => msg.status !== 'error')
+          .map((msg) => ({
+            role: msg.role,
+            content: msg.content,
+          })),
         { role: 'user' as const, content },
       ];
 
-      // 开始流式响应
-      startStreaming(activeConversationId);
+      // 开始流式响应（占位消息创建即落盘，返回其稳定 id）
+      const assistantMessageId = startStreaming(activeConversationId);
 
       try {
         const stream = sendMessageStream(apiMessages, {
@@ -80,16 +83,17 @@ export function useChat() {
 
         await streamHandler.start(stream, {
           onChunk: (chunk) => {
-            appendStreamContent(chunk);
+            appendStreamContent(activeConversationId, assistantMessageId, chunk);
           },
           onComplete: (stats) => {
-            finishStreaming(toMessageStats(stats));
+            finishStreaming(activeConversationId, assistantMessageId, toMessageStats(stats));
           },
           onError: (error) => {
             const appError = parseError(error);
             logError(appError, 'useChat.sendMessage');
             message.error(appError.message);
-            cancelStreaming();
+            // 超时等异常也保留已收到的部分内容
+            cancelStreaming(activeConversationId, assistantMessageId);
 
             if (shouldShowConfigPanel(appError)) {
               setConfigPanelVisible(true);
@@ -100,7 +104,7 @@ export function useChat() {
         const appError = parseError(error);
         logError(appError, 'useChat.sendMessage');
         message.error(appError.message);
-        cancelStreaming();
+        cancelStreaming(activeConversationId, assistantMessageId);
 
         if (shouldShowConfigPanel(appError)) {
           setConfigPanelVisible(true);
@@ -126,7 +130,10 @@ export function useChat() {
    */
   const stopStreaming = useCallback(() => {
     streamHandler.abort();
-    cancelStreaming();
+    const state = useChatStore.getState();
+    if (state.streamingConversationId && state.streamingMessageId) {
+      cancelStreaming(state.streamingConversationId, state.streamingMessageId);
+    }
     message.info('已停止响应');
   }, [cancelStreaming]);
 
@@ -155,6 +162,7 @@ export function useChat() {
     messages,
     isStreaming,
     streamingMessageId,
+    streamingConversationId,
     isConfigValid,
 
     // Actions
