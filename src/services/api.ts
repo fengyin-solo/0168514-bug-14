@@ -20,20 +20,24 @@ function createClient(config: APIConfig): OpenAI {
  */
 export async function* sendMessageStream(
   messages: APIMessage[],
-  config: APIConfig
+  config: APIConfig,
+  signal?: AbortSignal
 ): AsyncGenerator<string, void, unknown> {
   const client = createClient(config);
-  
-  const stream = await client.chat.completions.create({
-    model: config.model,
-    messages: messages.map(msg => ({
-      role: msg.role,
-      content: msg.content,
-    })),
-    temperature: config.temperature,
-    max_tokens: config.maxTokens,
-    stream: true,
-  });
+
+  const stream = await client.chat.completions.create(
+    {
+      model: config.model,
+      messages: messages.map(msg => ({
+        role: msg.role,
+        content: msg.content,
+      })),
+      temperature: config.temperature,
+      max_tokens: config.maxTokens,
+      stream: true,
+    },
+    { signal }
+  );
   
   for await (const chunk of stream) {
     const content = chunk.choices[0]?.delta?.content;

@@ -6,7 +6,12 @@ const STORAGE_KEYS = {
   CONFIG: 'react-chat-config',
   CONVERSATIONS: 'react-chat-conversations',
   PROMPT_TEMPLATES: 'react-chat-prompt-templates',
+  /** 已删除对话的 ID 墓碑（用于多窗口同步删除操作） */
+  DELETED_CONVERSATIONS: 'react-chat-deleted-conversations',
 } as const;
+
+/** 墓碑数量上限，避免无限增长 */
+const MAX_TOMBSTONES = 200;
 
 /**
  * 简单的加密函数（Base64 + 字符偏移）
@@ -144,14 +149,53 @@ export function loadConversations(): Conversation[] {
       return [];
     }
     
-    // 过滤无效数据并按更新时间排序
+    // 过滤无效数据；上次会话未写完的消息收敛为错误态并保留已收到的正文；
+    // 同一消息 id 只保留第一次出现，避免任何重复条目
     return parsed
       .filter(conv => conv && conv.id && Array.isArray(conv.messages))
-      .sort((a, b) => b.updatedAt - a.updatedAt);
+      .map(conv => ({
+        ...conv,
+        messages: dedupeAndReconcileMessages(conv.messages),
+      }))
+      .sort(compareConversations);
   } catch (error) {
     console.error('Failed to load conversations:', error);
     return [];
   }
+}
+
+/**
+ * 对话排序：updatedAt 降序，createdAt / id 作为确定性兜底，保证次序稳定
+ */
+export function compareConversations(a: Conversation, b: Conversation): number {
+  if (b.updatedAt !== a.updatedAt) return b.updatedAt - a.updatedAt;
+  if (b.createdAt !== a.createdAt) return b.createdAt - a.createdAt;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
+ * 收敛消息列表：按 id 去重（保留首次出现），并把未完成状态的消息标记为错误，
+ * 已接收的正文原样保留
+ */
+export function dedupeAndReconcileMessages(messages: Conversation['messages']): Conversation['messages'] {
+  return dedupeMessagesById(messages).map(msg => (
+    msg.status === 'streaming' || msg.status === 'pending'
+      ? { ...msg, status: 'error' as const, content: msg.content || '（响应未完成）' }
+      : msg
+  ));
+}
+
+/**
+ * 按消息 id 去重，保留首次出现的条目，其余字段不做改动
+ */
+export function dedupeMessagesById(messages: Conversation['messages']): Conversation['messages'] {
+  const seen = new Set<string>();
+
+  return messages.filter((msg) => {
+    if (!msg || !msg.id || seen.has(msg.id)) return false;
+    seen.add(msg.id);
+    return true;
+  });
 }
 
 /**
@@ -162,6 +206,56 @@ export function clearConversations(): void {
     localStorage.removeItem(STORAGE_KEYS.CONVERSATIONS);
   } catch (error) {
     console.error('Failed to clear conversations:', error);
+  }
+}
+
+/**
+ * 读取已删除对话的 ID 墓碑
+ * @returns 墓碑 ID 数组（最新删除的在前）
+ */
+export function loadDeletedConversationIds(): string[] {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEYS.DELETED_CONVERSATIONS);
+    if (!stored) return [];
+
+    const parsed = JSON.parse(stored);
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 追加已删除对话的 ID 墓碑（保留最近的 MAX_TOMBSTONES 条）
+ * @param ids 新删除的对话 ID
+ * @returns 追加后的完整墓碑列表
+ */
+export function addDeletedConversationIds(ids: string[]): string[] {
+  const merged = [...ids, ...loadDeletedConversationIds()].filter(
+    (id, index, arr) => arr.indexOf(id) === index
+  );
+  const tombstones = merged.slice(0, MAX_TOMBSTONES);
+
+  try {
+    localStorage.setItem(STORAGE_KEYS.DELETED_CONVERSATIONS, JSON.stringify(tombstones));
+  } catch (error) {
+    console.error('Failed to save deleted conversation tombstones:', error);
+  }
+
+  return tombstones;
+}
+
+/**
+ * 用指定列表覆盖墓碑（多窗口同步合并时使用）
+ */
+export function saveDeletedConversationIds(tombstones: string[]): void {
+  try {
+    localStorage.setItem(
+      STORAGE_KEYS.DELETED_CONVERSATIONS,
+      JSON.stringify(tombstones.slice(0, MAX_TOMBSTONES))
+    );
+  } catch (error) {
+    console.error('Failed to save deleted conversation tombstones:', error);
   }
 }
 

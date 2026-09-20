@@ -20,8 +20,10 @@ export interface StreamCallbacks {
   onChunk: (chunk: string) => void;
   /** 流完成时调用 */
   onComplete: (stats: ResponseStats) => void;
-  /** 发生错误时调用 */
+  /** 发生错误时调用（超时/网络错误等，不含主动中止） */
   onError: (error: Error) => void;
+  /** 流被主动中止时调用（已接收的内容由调用方决定如何落盘） */
+  onAbort?: () => void;
 }
 
 /**
@@ -30,34 +32,51 @@ export interface StreamCallbacks {
  */
 export class StreamHandler {
   private abortController: AbortController | null = null;
+  private externalSignal: AbortSignal | null = null;
   private isActive = false;
   private startTime = 0;
   private firstByteTime: number | null = null;
   private accumulatedContent = '';
 
+  private get aborted(): boolean {
+    return this.abortController?.signal.aborted === true
+      || this.externalSignal?.aborted === true;
+  }
+
   /**
    * 开始处理流
    * @param stream 异步迭代器
    * @param callbacks 回调函数
+   * @param signal 外部中止信号（可选，与内部 abort 共享生命周期）
    */
   async start(
     stream: AsyncGenerator<string, void, unknown>,
-    callbacks: StreamCallbacks
+    callbacks: StreamCallbacks,
+    signal?: AbortSignal
   ): Promise<void> {
     if (this.isActive) {
       this.abort();
     }
 
     this.abortController = new AbortController();
+    this.externalSignal = signal ?? null;
     this.isActive = true;
     this.startTime = Date.now();
     this.firstByteTime = null;
     this.accumulatedContent = '';
 
+    if (signal?.aborted) {
+      this.isActive = false;
+      this.abortController = null;
+      callbacks.onAbort?.();
+      return;
+    }
+    signal?.addEventListener('abort', () => this.abortController?.abort(), { once: true });
+
     try {
       for await (const chunk of stream) {
         // 检查是否已中止
-        if (this.abortController?.signal.aborted) {
+        if (this.aborted) {
           break;
         }
 
@@ -70,18 +89,23 @@ export class StreamHandler {
         callbacks.onChunk(chunk);
       }
 
-      // 流正常完成
-      if (!this.abortController?.signal.aborted) {
+      if (this.aborted) {
+        callbacks.onAbort?.();
+      } else {
+        // 流正常完成
         const stats = this.calculateStats();
         callbacks.onComplete(stats);
       }
     } catch (error) {
-      if (!this.abortController?.signal.aborted) {
+      if (this.aborted) {
+        callbacks.onAbort?.();
+      } else {
         callbacks.onError(error instanceof Error ? error : new Error(String(error)));
       }
     } finally {
       this.isActive = false;
       this.abortController = null;
+      this.externalSignal = null;
     }
   }
 
